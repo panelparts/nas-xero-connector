@@ -6,7 +6,7 @@ compatibility_date = "2024-09-01"
 # first deploy, because no "id" is given below — you don't need to create
 # it yourself or add a binding by hand in the dashboard.
 kv_namespaces = [
-  { binding = "XERO_KV",id =  7b39de8798254bfba3b592b29e5f56aa}
+  { binding = "XERO_KV", id = 7b39de8798254bfba3b592b29e5f56aa }
 ]
 
 [vars]
