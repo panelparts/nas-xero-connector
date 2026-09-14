@@ -27,7 +27,7 @@ const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize';
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token';
 const XERO_CONNECTIONS_URL = 'https://api.xero.com/connections';
 const XERO_API_BASE = 'https://api.xero.com/api.xro/2.0';
-const SCOPES = 'openid profile email accounting.transactions accounting.contacts offline_access';
+const SCOPES = 'openid profile email accounting.invoices accounting.contacts offline_access';
 const CONNECTION_KEY = 'connection';
 const STATE_TTL_SECONDS = 600; // 10 minutes to complete the Xero login
 
