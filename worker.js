@@ -10,14 +10,22 @@
  * that matches the app's own "anyone with the link can use it" design.
  *
  * Endpoints:
- *   GET  /connect?return=<url>   -> redirects the browser into Xero's login
- *   GET  /callback               -> Xero redirects back here after login
- *   GET  /status                 -> { connected, tenantName, connectedAt }
- *   POST /disconnect             -> forgets the stored connection
- *   POST /invoices               -> creates a draft invoice in Xero
+ *   GET  /connect?return=<url>          -> redirects the browser into Xero's login
+ *   GET  /callback                       -> Xero redirects back here after login
+ *   GET  /status                         -> { connected, tenantName, connectedAt }
+ *   POST /disconnect                     -> forgets the stored connection
+ *   POST /invoices                       -> creates a draft invoice in Xero
+ *   GET  /task/create-invoice?token=&payload=  -> same as POST /invoices, but
+ *        GET-only with the JSON payload base64url-encoded in the query string.
+ *        This exists because the app itself (a published Claude Artifact) is
+ *        never allowed to call this Worker directly — Claude's Artifact
+ *        hosting blocks outbound network calls from the page for security.
+ *        Instead the app just marks an invoice "queued", and a scheduled
+ *        Claude task calls this endpoint in the background to actually send
+ *        it — see SETUP.md "Automatic Xero push" for the full explanation.
  *
  * Required bindings (see SETUP.md):
- *   KV secret/vars   XERO_CLIENT_ID, XERO_CLIENT_SECRET
+ *   KV secret/vars   XERO_CLIENT_ID, XERO_CLIENT_SECRET, TASK_TOKEN
  *   KV namespace     XERO_KV
  *   optional var     ALLOWED_ORIGIN (defaults to "*")
  *   optional var     DEFAULT_ACCOUNT_CODE (defaults to "200")
@@ -54,6 +62,9 @@ export default {
       }
       if (url.pathname === '/invoices' && request.method === 'POST') {
         return await handleCreateInvoice(request, env);
+      }
+      if (url.pathname === '/task/create-invoice' && request.method === 'GET') {
+        return await handleTaskCreateInvoice(url, env);
       }
       return corsResponse(env, json({ error: 'not_found' }, 404));
     } catch (err) {
@@ -184,22 +195,50 @@ async function handleDisconnect(env) {
 /* ----------------------------- invoices ---------------------------------- */
 
 async function handleCreateInvoice(request, env) {
-  requireEnv(env, ['XERO_CLIENT_ID', 'XERO_CLIENT_SECRET']);
-  const raw = await env.XERO_KV.get(CONNECTION_KEY);
-  if (!raw) return corsResponse(env, json({ ok: false, error: 'not_connected' }, 409));
-  const conn = JSON.parse(raw);
-
   let payload;
   try {
     payload = await request.json();
   } catch (err) {
     return corsResponse(env, json({ ok: false, error: 'invalid_json' }, 400));
   }
+  const result = await createInvoiceCore(env, payload);
+  return corsResponse(env, json(result.body, result.status));
+}
+
+/**
+ * GET-based invoice creation for a background job that can't make a POST
+ * request (e.g. Claude's own scheduled-task runner, which can only issue
+ * simple GET fetches to this Worker — see SETUP.md "Automatic Xero push").
+ * Protected by a shared-secret token so it can't be triggered by anyone
+ * who merely knows the URL.
+ */
+async function handleTaskCreateInvoice(url, env) {
+  requireEnv(env, ['TASK_TOKEN']);
+  const token = url.searchParams.get('token') || '';
+  if (token !== env.TASK_TOKEN) {
+    return corsResponse(env, json({ ok: false, error: 'unauthorized' }, 401));
+  }
+  const encoded = url.searchParams.get('payload') || '';
+  let payload;
+  try {
+    payload = JSON.parse(decodeURIComponent(escape(atob(encoded.replace(/-/g, '+').replace(/_/g, '/')))));
+  } catch (err) {
+    return corsResponse(env, json({ ok: false, error: 'invalid_payload' }, 400));
+  }
+  const result = await createInvoiceCore(env, payload);
+  return corsResponse(env, json(result.body, result.status));
+}
+
+async function createInvoiceCore(env, payload) {
+  requireEnv(env, ['XERO_CLIENT_ID', 'XERO_CLIENT_SECRET']);
+  const raw = await env.XERO_KV.get(CONNECTION_KEY);
+  if (!raw) return { status: 409, body: { ok: false, error: 'not_connected' } };
+  const conn = JSON.parse(raw);
 
   const customerName = (payload.customerName || '').trim() || 'Unknown customer';
   const lineItems = Array.isArray(payload.lineItems) ? payload.lineItems : [];
   if (!lineItems.length) {
-    return corsResponse(env, json({ ok: false, error: 'no_line_items' }, 400));
+    return { status: 400, body: { ok: false, error: 'no_line_items' } };
   }
   const accountCode = payload.accountCode || env.DEFAULT_ACCOUNT_CODE || '200';
   const invoiceDate = payload.date || new Date().toISOString().slice(0, 10);
@@ -214,14 +253,14 @@ async function handleCreateInvoice(request, env) {
     conn.refreshToken = refreshed.refresh_token;
     await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
   } catch (err) {
-    return corsResponse(env, json({ ok: false, error: 'reauth_required' }, 401));
+    return { status: 401, body: { ok: false, error: 'reauth_required' } };
   }
 
   let contactId;
   try {
     contactId = await ensureContact(accessToken, conn.tenantId, customerName);
   } catch (err) {
-    return corsResponse(env, json({ ok: false, error: 'contact_failed', message: String(err.message || err) }, 502));
+    return { status: 502, body: { ok: false, error: 'contact_failed', message: String(err.message || err) } };
   }
 
   const invoiceBody = {
@@ -248,23 +287,23 @@ async function handleCreateInvoice(request, env) {
       body: JSON.stringify({ Invoices: [invoiceBody] }),
     });
   } catch (err) {
-    return corsResponse(env, json({ ok: false, error: 'invoice_failed', message: String(err.message || err) }, 502));
+    return { status: 502, body: { ok: false, error: 'invoice_failed', message: String(err.message || err) } };
   }
 
   const created = (createRes.Invoices || [])[0];
   if (!created) {
-    return corsResponse(env, json({ ok: false, error: 'invoice_not_returned' }, 502));
+    return { status: 502, body: { ok: false, error: 'invoice_not_returned' } };
   }
 
-  return corsResponse(
-    env,
-    json({
+  return {
+    status: 200,
+    body: {
       ok: true,
       invoiceId: created.InvoiceID,
       invoiceNumber: created.InvoiceNumber,
       invoiceUrl: 'https://go.xero.com/AccountsReceivable/View.aspx?InvoiceID=' + created.InvoiceID,
-    })
-  );
+    },
+  };
 }
 
 async function refreshAccessToken(env, refreshToken) {
@@ -341,3 +380,4 @@ function requireEnv(env, keys) {
   const missing = keys.filter((k) => !env[k]);
   if (missing.length) throw new Error('Missing worker config: ' + missing.join(', '));
 }
+  
