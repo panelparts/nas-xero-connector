@@ -10,7 +10,7 @@
     {
       "binding": "DB",
       "database_name": "newcastle-automotive-solutions-db",
-      "database_id": "PASTE-YOUR-DATABASE-ID-HERE"
+      "database_id": "159b2c5e-f4e0-431b-92ab-4d10c8e488b3"
     }
   ],
   "r2_buckets": [
