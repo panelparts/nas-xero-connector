@@ -14,7 +14,10 @@
  *   GET  /callback                       -> Xero redirects back here after login
  *   GET  /status                         -> { connected, tenantName, connectedAt }
  *   POST /disconnect                     -> forgets the stored connection
+ *        Also requires `Authorization: Bearer <TASK_TOKEN>`.
  *   POST /invoices                       -> creates a draft invoice in Xero
+ *        Requires `Authorization: Bearer <TASK_TOKEN>` — called by the
+ *        standalone Newcastle Automotive Solutions backend, server-to-server.
  *   GET  /task/create-invoice?token=&payload=  -> same as POST /invoices, but
  *        GET-only with the JSON payload base64url-encoded in the query string.
  *        This exists because the app itself (a published Claude Artifact) is
@@ -23,6 +26,17 @@
  *        Instead the app just marks an invoice "queued", and a scheduled
  *        Claude task calls this endpoint in the background to actually send
  *        it — see SETUP.md "Automatic Xero push" for the full explanation.
+ *   GET  /task/attach-photo?token=&invoiceId=&photoUrl=&filename=
+ *        Legacy path, kept for backwards compatibility with the old
+ *        Claude-Artifact version of the app (see SETUP.md "Automatic Xero
+ *        push") — attaches one already-uploaded photo, fetched server-side
+ *        from photoUrl, to an existing Xero invoice.
+ *   PUT  /internal/invoices/{invoiceId}/attachments/{filename}
+ *        The current path, used by the standalone Newcastle Automotive Solutions backend (its
+ *        own Worker, not a Claude Artifact) — same idea as /task/attach-photo
+ *        but the caller PUTs the photo's raw bytes directly (it already has
+ *        them from its own storage) instead of handing over a URL to fetch.
+ *        Authenticated the same way, via `Authorization: Bearer <TASK_TOKEN>`.
  *
  * Required bindings (see SETUP.md):
  *   KV secret/vars   XERO_CLIENT_ID, XERO_CLIENT_SECRET, TASK_TOKEN
@@ -58,13 +72,20 @@ export default {
         return await handleStatus(env);
       }
       if (url.pathname === '/disconnect' && request.method === 'POST') {
-        return await handleDisconnect(env);
+        return await handleDisconnect(request, env);
       }
       if (url.pathname === '/invoices' && request.method === 'POST') {
         return await handleCreateInvoice(request, env);
       }
       if (url.pathname === '/task/create-invoice' && request.method === 'GET') {
         return await handleTaskCreateInvoice(url, env);
+      }
+      if (url.pathname === '/task/attach-photo' && request.method === 'GET') {
+        return await handleTaskAttachPhoto(url, env);
+      }
+      const internalAttachMatch = url.pathname.match(/^\/internal\/invoices\/([^/]+)\/attachments\/([^/]+)$/);
+      if (internalAttachMatch && request.method === 'PUT') {
+        return await handleInternalAttach(request, env, internalAttachMatch[1], internalAttachMatch[2]);
       }
       return corsResponse(env, json({ error: 'not_found' }, 404));
     } catch (err) {
@@ -187,7 +208,13 @@ async function handleStatus(env) {
   );
 }
 
-async function handleDisconnect(env) {
+async function handleDisconnect(request, env) {
+  requireEnv(env, ['TASK_TOKEN']);
+  const auth = request.headers.get('Authorization') || '';
+  const token = auth.replace(/^Bearer\s+/i, '');
+  if (token !== env.TASK_TOKEN) {
+    return corsResponse(env, json({ ok: false, error: 'unauthorized' }, 401));
+  }
   await env.XERO_KV.delete(CONNECTION_KEY);
   return corsResponse(env, json({ ok: true }));
 }
@@ -195,6 +222,12 @@ async function handleDisconnect(env) {
 /* ----------------------------- invoices ---------------------------------- */
 
 async function handleCreateInvoice(request, env) {
+  requireEnv(env, ['TASK_TOKEN']);
+  const auth = request.headers.get('Authorization') || '';
+  const token = auth.replace(/^Bearer\s+/i, '');
+  if (token !== env.TASK_TOKEN) {
+    return corsResponse(env, json({ ok: false, error: 'unauthorized' }, 401));
+  }
   let payload;
   try {
     payload = await request.json();
@@ -306,6 +339,141 @@ async function createInvoiceCore(env, payload) {
   };
 }
 
+/**
+ * Attaches one photo to an already-created Xero invoice. The photo itself is
+ * never routed through the calling GET request (its bytes would be far too
+ * large for a query string) — instead this Worker fetches it directly,
+ * server-side, from photoUrl (a Claude Artifact 'assets' URL, which this
+ * Worker — unlike the app page — has no CSP restriction against calling),
+ * then re-uploads those same bytes to Xero's Attachments API.
+ */
+async function handleTaskAttachPhoto(url, env) {
+  requireEnv(env, ['TASK_TOKEN']);
+  const token = url.searchParams.get('token') || '';
+  if (token !== env.TASK_TOKEN) {
+    return corsResponse(env, json({ ok: false, error: 'unauthorized' }, 401));
+  }
+  const invoiceId = url.searchParams.get('invoiceId') || '';
+  const photoUrl = url.searchParams.get('photoUrl') || '';
+  const filename = (url.searchParams.get('filename') || 'photo.jpg').replace(/[^A-Za-z0-9_.-]/g, '_') || 'photo.jpg';
+  if (!invoiceId || !photoUrl) {
+    return corsResponse(env, json({ ok: false, error: 'missing_params' }, 400));
+  }
+
+  requireEnv(env, ['XERO_CLIENT_ID', 'XERO_CLIENT_SECRET']);
+  const raw = await env.XERO_KV.get(CONNECTION_KEY);
+  if (!raw) return corsResponse(env, json({ ok: false, error: 'not_connected' }, 409));
+  const conn = JSON.parse(raw);
+
+  let accessToken;
+  try {
+    const refreshed = await refreshAccessToken(env, conn.refreshToken);
+    accessToken = refreshed.access_token;
+    conn.refreshToken = refreshed.refresh_token;
+    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+  } catch (err) {
+    return corsResponse(env, json({ ok: false, error: 'reauth_required' }, 401));
+  }
+
+  let photoRes;
+  try {
+    photoRes = await fetch(photoUrl);
+    if (!photoRes.ok) throw new Error('status ' + photoRes.status);
+  } catch (err) {
+    return corsResponse(env, json({ ok: false, error: 'photo_fetch_failed', message: String((err && err.message) || err) }, 502));
+  }
+  const contentType = photoRes.headers.get('Content-Type') || 'image/jpeg';
+  const bodyBuf = await photoRes.arrayBuffer();
+
+  let attachRes;
+  try {
+    attachRes = await fetch(
+      XERO_API_BASE + '/Invoices/' + encodeURIComponent(invoiceId) + '/Attachments/' + encodeURIComponent(filename),
+      {
+        method: 'PUT', // create-or-update: safe to retry with the same filename
+        headers: {
+          Authorization: 'Bearer ' + accessToken,
+          'Xero-tenant-id': conn.tenantId,
+          'Content-Type': contentType,
+          Accept: 'application/json',
+        },
+        body: bodyBuf,
+      }
+    );
+  } catch (err) {
+    return corsResponse(env, json({ ok: false, error: 'attach_failed', message: String((err && err.message) || err) }, 502));
+  }
+  if (!attachRes.ok) {
+    const text = await attachRes.text().catch(() => '');
+    return corsResponse(env, json({ ok: false, error: 'attach_rejected', message: text.slice(0, 300) }, 502));
+  }
+  const attachData = await attachRes.json().catch(() => null);
+  const created = attachData && attachData.Attachments && attachData.Attachments[0];
+  return corsResponse(env, json({ ok: true, attachmentId: created ? created.AttachmentID : null, filename: filename }));
+}
+
+/**
+ * Server-to-server attachment upload for the new standalone Newcastle Automotive Solutions
+ * backend (which replaced the Claude Artifact version of the app) — the
+ * caller already has the photo's raw bytes in hand (from its own R2
+ * storage) and PUTs them directly, so there's no URL to fetch and no
+ * base64-in-a-query-string payload at all. Authenticated with the same
+ * shared secret as the /task/* endpoints above (TASK_TOKEN), sent as a
+ * normal Authorization header this time since this is a real HTTP client,
+ * not a GET-only fetch tool.
+ */
+async function handleInternalAttach(request, env, invoiceId, filename) {
+  requireEnv(env, ['TASK_TOKEN']);
+  const auth = request.headers.get('Authorization') || '';
+  const token = auth.replace(/^Bearer\s+/i, '');
+  if (token !== env.TASK_TOKEN) {
+    return corsResponse(env, json({ ok: false, error: 'unauthorized' }, 401));
+  }
+  const contentType = request.headers.get('Content-Type') || 'image/jpeg';
+  const bodyBuf = await request.arrayBuffer();
+
+  requireEnv(env, ['XERO_CLIENT_ID', 'XERO_CLIENT_SECRET']);
+  const raw = await env.XERO_KV.get(CONNECTION_KEY);
+  if (!raw) return corsResponse(env, json({ ok: false, error: 'not_connected' }, 409));
+  const conn = JSON.parse(raw);
+
+  let accessToken;
+  try {
+    const refreshed = await refreshAccessToken(env, conn.refreshToken);
+    accessToken = refreshed.access_token;
+    conn.refreshToken = refreshed.refresh_token;
+    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+  } catch (err) {
+    return corsResponse(env, json({ ok: false, error: 'reauth_required' }, 401));
+  }
+
+  let attachRes;
+  try {
+    attachRes = await fetch(
+      XERO_API_BASE + '/Invoices/' + encodeURIComponent(invoiceId) + '/Attachments/' + encodeURIComponent(filename),
+      {
+        method: 'PUT', // create-or-update: safe to retry with the same filename
+        headers: {
+          Authorization: 'Bearer ' + accessToken,
+          'Xero-tenant-id': conn.tenantId,
+          'Content-Type': contentType,
+          Accept: 'application/json',
+        },
+        body: bodyBuf,
+      }
+    );
+  } catch (err) {
+    return corsResponse(env, json({ ok: false, error: 'attach_failed', message: String((err && err.message) || err) }, 502));
+  }
+  if (!attachRes.ok) {
+    const text = await attachRes.text().catch(() => '');
+    return corsResponse(env, json({ ok: false, error: 'attach_rejected', message: text.slice(0, 300) }, 502));
+  }
+  const attachData = await attachRes.json().catch(() => null);
+  const created = attachData && attachData.Attachments && attachData.Attachments[0];
+  return corsResponse(env, json({ ok: true, attachmentId: created ? created.AttachmentID : null, filename: filename }));
+}
+
 async function refreshAccessToken(env, refreshToken) {
   const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken });
   const res = await fetch(XERO_TOKEN_URL, {
@@ -380,4 +548,3 @@ function requireEnv(env, keys) {
   const missing = keys.filter((k) => !env[k]);
   if (missing.length) throw new Error('Missing worker config: ' + missing.join(', '));
 }
-  
