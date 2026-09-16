@@ -1,12 +1,22 @@
 {
-  "name": "nas-xero-connector",
-  "main": "worker.js",
-  "compatibility_date": "2024-09-01",
-  "kv_namespaces": [
-    { "binding": "XERO_KV", "id": "7b39de8798254bfba3b592b29e5f56aa" }
+  "name": "newcastle-automotive-solutions",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "newcastle-automotive-solutions-db",
+      "database_id": "PASTE-YOUR-DATABASE-ID-HERE"
+    }
+  ],
+  "r2_buckets": [
+    { "binding": "PHOTOS", "bucket_name": "newcastle-automotive-solutions-photos" }
   ],
   "vars": {
-    "ALLOWED_ORIGIN": "*",
-    "DEFAULT_ACCOUNT_CODE": "200"
+    "XERO_WORKER_URL": "https://nas-xero-connector.nas-newcastle.workers.dev"
   }
 }
