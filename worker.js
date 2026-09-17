@@ -26,6 +26,7 @@
  *        Instead the app just marks an invoice "queued", and a scheduled
  *        Claude task calls this endpoint in the background to actually send
  *        it — see SETUP.md "Automatic Xero push" for the full explanation.
+ * (see also POST /contacts above, and POST /webhook below)
  *   GET  /task/attach-photo?token=&invoiceId=&photoUrl=&filename=
  *        Legacy path, kept for backwards compatibility with the old
  *        Claude-Artifact version of the app (see SETUP.md "Automatic Xero
@@ -37,19 +38,63 @@
  *        but the caller PUTs the photo's raw bytes directly (it already has
  *        them from its own storage) instead of handing over a URL to fetch.
  *        Authenticated the same way, via `Authorization: Bearer <TASK_TOKEN>`.
+ *   POST /contacts                       -> creates/updates a Xero contact from
+ *        the app's customer record (matched by ContactID if already linked,
+ *        else by exact name — Xero enforces unique contact names anyway).
+ *        Requires `Authorization: Bearer <TASK_TOKEN>` — the other half of
+ *        the two-way customer sync, called by the app on every customer
+ *        save. See handleUpsertContact()/upsertContactCore() below.
+ *   POST /webhook
+ *        Xero calls this directly (not the app, not a scheduled task) the
+ *        moment an invoice OR a contact changes on the Xero side — including
+ *        an invoice being voided/deleted/paid, or a contact's name/email/
+ *        phone/address being edited. This is what makes both syncs
+ *        two-directional: without it, this connector only ever pushed
+ *        app -> Xero, and any change made in Xero itself never made it back.
+ *        Every call is signature-checked against XERO_WEBHOOK_KEY (Xero's
+ *        `x-xero-signature` header — see handleWebhook() below); an invalid
+ *        signature gets a 401 and is otherwise ignored. For every genuine
+ *        "INVOICE" or "CONTACT" event, this worker looks up that resource's
+ *        current state directly from Xero's API (the webhook payload itself
+ *        only ever contains an ID, never the details) and forwards it on to
+ *        the main app via a Service Binding (env.APP_WORKER), authenticated
+ *        with a second shared secret (APP_WEBHOOK_FORWARD_TOKEN, must equal
+ *        WEBHOOK_FORWARD_TOKEN on that Worker) — see forwardInvoiceStatus()/
+ *        forwardContactUpdate() below. The app then finds the matching
+ *        record by its stored Xero id and updates it (an invoice's status
+ *        always follows Xero; a customer only follows Xero if the app's own
+ *        copy isn't newer — "app wins" on conflict, see the app's
+ *        src/worker.js). Setup for this needs one manual step in Xero's own
+ *        Developer portal (only Xero can generate XERO_WEBHOOK_KEY) — see
+ *        DEPLOY.md "Part 4B".
  *
  * Required bindings (see SETUP.md):
  *   KV secret/vars   XERO_CLIENT_ID, XERO_CLIENT_SECRET, TASK_TOKEN
  *   KV namespace     XERO_KV
  *   optional var     ALLOWED_ORIGIN (defaults to "*")
  *   optional var     DEFAULT_ACCOUNT_CODE (defaults to "200")
+ *   secret           XERO_WEBHOOK_KEY        (from Xero's Webhooks setup — see Part 4B)
+ *   secret           APP_WEBHOOK_FORWARD_TOKEN  (shared with WEBHOOK_FORWARD_TOKEN on the app)
+ *   service binding  APP_WORKER  → the newcastle-automotive-solutions Worker
  */
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize';
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token';
 const XERO_CONNECTIONS_URL = 'https://api.xero.com/connections';
 const XERO_API_BASE = 'https://api.xero.com/api.xro/2.0';
-const SCOPES = 'openid profile email accounting.invoices accounting.contacts offline_access';
+// 2026-09-17: added accounting.attachments — this is the actual reason photos
+// were never showing up on invoices in Xero. Creating/updating an invoice's
+// Attachments (handleTaskAttachPhoto / handleInternalAttach below) needs this
+// scope; without it Xero's Attachments API silently rejects every PUT with a
+// 403 no matter how correct the request is, and attachPhotoToXero() in the
+// app Worker swallows that into a plain `false` — so nothing in this app's
+// own logs or UI ever pointed at the real cause. Adding the scope here only
+// takes effect for a *new* authorization — an existing connection's access
+// token was already issued under the old (narrower) scope list, and simply
+// refreshing that token does not add scopes. So after deploying this, the
+// user needs to disconnect and reconnect Xero once (Account -> Xero
+// connection) to actually get a token that's allowed to attach files.
+const SCOPES = 'openid profile email accounting.invoices accounting.contacts accounting.attachments offline_access';
 const CONNECTION_KEY = 'connection';
 const STATE_TTL_SECONDS = 600; // 10 minutes to complete the Xero login
 
@@ -77,6 +122,9 @@ export default {
       if (url.pathname === '/invoices' && request.method === 'POST') {
         return await handleCreateInvoice(request, env);
       }
+      if (url.pathname === '/contacts' && request.method === 'POST') {
+        return await handleUpsertContact(request, env);
+      }
       if (url.pathname === '/task/create-invoice' && request.method === 'GET') {
         return await handleTaskCreateInvoice(url, env);
       }
@@ -86,6 +134,9 @@ export default {
       const internalAttachMatch = url.pathname.match(/^\/internal\/invoices\/([^/]+)\/attachments\/([^/]+)$/);
       if (internalAttachMatch && request.method === 'PUT') {
         return await handleInternalAttach(request, env, internalAttachMatch[1], internalAttachMatch[2]);
+      }
+      if (url.pathname === '/webhook' && request.method === 'POST') {
+        return await handleWebhook(request, env);
       }
       return corsResponse(env, json({ error: 'not_found' }, 404));
     } catch (err) {
@@ -339,6 +390,98 @@ async function createInvoiceCore(env, payload) {
   };
 }
 
+/* ------------------------------- contacts -------------------------------- */
+/* The other half of the two-way customer sync (see the app's src/worker.js
+   for the full policy) — creates or updates a Xero contact from the app's
+   customer record. */
+
+async function handleUpsertContact(request, env) {
+  requireEnv(env, ['TASK_TOKEN']);
+  const auth = request.headers.get('Authorization') || '';
+  const token = auth.replace(/^Bearer\s+/i, '');
+  if (token !== env.TASK_TOKEN) {
+    return corsResponse(env, json({ ok: false, error: 'unauthorized' }, 401));
+  }
+  let payload;
+  try {
+    payload = await request.json();
+  } catch (err) {
+    return corsResponse(env, json({ ok: false, error: 'invalid_json' }, 400));
+  }
+  const result = await upsertContactCore(env, payload);
+  return corsResponse(env, json(result.body, result.status));
+}
+
+async function upsertContactCore(env, payload) {
+  requireEnv(env, ['XERO_CLIENT_ID', 'XERO_CLIENT_SECRET']);
+  const raw = await env.XERO_KV.get(CONNECTION_KEY);
+  if (!raw) return { status: 409, body: { ok: false, error: 'not_connected' } };
+  const conn = JSON.parse(raw);
+
+  const name = (payload.name || '').trim();
+  if (!name) return { status: 400, body: { ok: false, error: 'missing_name' } };
+
+  let accessToken;
+  try {
+    const refreshed = await refreshAccessToken(env, conn.refreshToken);
+    accessToken = refreshed.access_token;
+    conn.refreshToken = refreshed.refresh_token;
+    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+  } catch (err) {
+    return { status: 401, body: { ok: false, error: 'reauth_required' } };
+  }
+
+  const contactFields = {
+    Name: name,
+    EmailAddress: payload.email || undefined,
+    Phones: payload.phone ? [{ PhoneType: 'DEFAULT', PhoneNumber: payload.phone }] : undefined,
+    Addresses: payload.address ? [{ AddressType: 'STREET', AddressLine1: payload.address }] : undefined,
+  };
+
+  try {
+    // Already linked to a known Xero contact — update it directly by ID, no
+    // name lookup needed (and none of the "name already exists" risk that
+    // matters below).
+    if (payload.contactId) {
+      const updated = await xeroApiFetch(accessToken, conn.tenantId, '/Contacts', {
+        method: 'POST',
+        body: JSON.stringify({ Contacts: [Object.assign({ ContactID: payload.contactId }, contactFields)] }),
+      });
+      const c = (updated.Contacts || [])[0];
+      if (!c) return { status: 502, body: { ok: false, error: 'contact_not_returned' } };
+      return { status: 200, body: { ok: true, contactId: c.ContactID, updatedDateUtc: c.UpdatedDateUTC } };
+    }
+
+    // Not linked yet — look up by exact name first. Xero enforces unique
+    // contact names across all active contacts anyway (it would otherwise
+    // reject a plain create with "contact name must be unique"), so this
+    // both avoids that error and links up with a contact that already
+    // exists in Xero (created by hand, or by the old invoice-time-only
+    // linking this replaces) instead of creating a duplicate.
+    const escaped = name.replace(/"/g, '\\"');
+    const found = await xeroApiFetch(accessToken, conn.tenantId, '/Contacts?where=' + encodeURIComponent('Name=="' + escaped + '"'));
+    const existing = (found.Contacts || [])[0];
+    if (existing) {
+      const updated = await xeroApiFetch(accessToken, conn.tenantId, '/Contacts', {
+        method: 'POST',
+        body: JSON.stringify({ Contacts: [Object.assign({ ContactID: existing.ContactID }, contactFields)] }),
+      });
+      const c = (updated.Contacts || [])[0] || existing;
+      return { status: 200, body: { ok: true, contactId: c.ContactID, updatedDateUtc: c.UpdatedDateUTC } };
+    }
+
+    const created = await xeroApiFetch(accessToken, conn.tenantId, '/Contacts', {
+      method: 'PUT',
+      body: JSON.stringify({ Contacts: [contactFields] }),
+    });
+    const c = (created.Contacts || [])[0];
+    if (!c) return { status: 502, body: { ok: false, error: 'contact_not_returned' } };
+    return { status: 200, body: { ok: true, contactId: c.ContactID, updatedDateUtc: c.UpdatedDateUTC } };
+  } catch (err) {
+    return { status: 502, body: { ok: false, error: 'xero_rejected', message: String((err && err.message) || err) } };
+  }
+}
+
 /**
  * Attaches one photo to an already-created Xero invoice. The photo itself is
  * never routed through the calling GET request (its bytes would be far too
@@ -472,6 +615,172 @@ async function handleInternalAttach(request, env, invoiceId, filename) {
   const attachData = await attachRes.json().catch(() => null);
   const created = attachData && attachData.Attachments && attachData.Attachments[0];
   return corsResponse(env, json({ ok: true, attachmentId: created ? created.AttachmentID : null, filename: filename }));
+}
+
+/* ------------------------------- webhook --------------------------------- */
+/* Receives Xero's own push notifications so a change made *in* Xero (voided,
+   deleted, marked paid) can flow back into the app — see the doc comment at
+   the top of this file for the full picture. This is the only inbound path
+   in this whole Worker that Xero itself calls, so it's authenticated
+   differently from everything else here (a signed request, not a bearer
+   token this app controls) and deliberately never throws past its own
+   try/catch: Xero disables a webhook subscription after too many non-200
+   responses, so a problem with one invoice should never take down delivery
+   for every other one. */
+
+async function handleWebhook(request, env) {
+  if (!env.XERO_WEBHOOK_KEY) {
+    // Not set up yet (Part 4B not done) — nothing we can safely verify, so
+    // there's nothing safe to do with this call.
+    return new Response('', { status: 401 });
+  }
+
+  const bodyText = await request.text();
+  const signature = request.headers.get('x-xero-signature') || '';
+  const valid = await verifyWebhookSignature(bodyText, signature, env.XERO_WEBHOOK_KEY);
+  if (!valid) {
+    return new Response('', { status: 401 });
+  }
+
+  // A valid, empty/near-empty payload is exactly what Xero sends when you
+  // click "Save" on a new webhook subscription to validate the URL (its
+  // "intent to receive" check) — a plain 200 here is all that needs to
+  // happen for that to succeed.
+  let payload;
+  try {
+    payload = bodyText ? JSON.parse(bodyText) : {};
+  } catch (err) {
+    return new Response('', { status: 200 });
+  }
+
+  const events = Array.isArray(payload.events) ? payload.events : [];
+  const invoiceIds = Array.from(
+    new Set(events.filter((e) => e && e.eventCategory === 'INVOICE' && e.resourceId).map((e) => e.resourceId))
+  );
+  const contactIds = Array.from(
+    new Set(events.filter((e) => e && e.eventCategory === 'CONTACT' && e.resourceId).map((e) => e.resourceId))
+  );
+
+  for (const invoiceId of invoiceIds) {
+    try {
+      await forwardInvoiceStatus(env, invoiceId);
+    } catch (err) {
+      // Best-effort, per invoice — see the note above on why this never
+      // turns into a non-200 response for the whole webhook call.
+    }
+  }
+  for (const contactId of contactIds) {
+    try {
+      await forwardContactUpdate(env, contactId);
+    } catch (err) {
+      // Best-effort, per contact — same reasoning as above.
+    }
+  }
+
+  return new Response('', { status: 200 });
+}
+
+async function verifyWebhookSignature(bodyText, signatureHeader, key) {
+  if (!signatureHeader) return false;
+  const enc = new TextEncoder();
+  const cryptoKey = await crypto.subtle.importKey('raw', enc.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sigBuf = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(bodyText));
+  const computed = btoa(String.fromCharCode.apply(null, Array.from(new Uint8Array(sigBuf))));
+  return computed === signatureHeader;
+}
+
+/**
+ * Looks up one invoice's current state directly from Xero (the webhook
+ * payload itself never contains anything but an ID and an event type) and
+ * relays {xeroInvoiceId, xeroStatus, amountPaid, amountDue} to the main app
+ * over the APP_WORKER service binding, the same Worker-to-Worker pattern
+ * (and for the same Cloudflare error-1042 reason) as every other
+ * cross-Worker call in this project.
+ */
+async function forwardInvoiceStatus(env, invoiceId) {
+  if (!env.APP_WORKER || !env.APP_WEBHOOK_FORWARD_TOKEN) return; // Part 4B not finished yet
+  requireEnv(env, ['XERO_CLIENT_ID', 'XERO_CLIENT_SECRET']);
+  const raw = await env.XERO_KV.get(CONNECTION_KEY);
+  if (!raw) return;
+  const conn = JSON.parse(raw);
+
+  let accessToken;
+  try {
+    const refreshed = await refreshAccessToken(env, conn.refreshToken);
+    accessToken = refreshed.access_token;
+    conn.refreshToken = refreshed.refresh_token;
+    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+  } catch (err) {
+    return; // can't refresh right now — a later webhook or a manual check will catch up
+  }
+
+  const invRes = await xeroApiFetch(accessToken, conn.tenantId, '/Invoices/' + encodeURIComponent(invoiceId));
+  const invoice = (invRes.Invoices || [])[0];
+  if (!invoice) return;
+
+  await env.APP_WORKER.fetch('https://app-worker.internal/api/internal/xero-invoice-status', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + env.APP_WEBHOOK_FORWARD_TOKEN,
+    },
+    body: JSON.stringify({
+      xeroInvoiceId: invoice.InvoiceID,
+      xeroStatus: invoice.Status,
+      amountPaid: invoice.AmountPaid || 0,
+      amountDue: invoice.AmountDue,
+    }),
+  });
+}
+
+/**
+ * Looks up one contact's current state directly from Xero and relays
+ * {xeroContactId, name, email, phone, address, xeroUpdatedAt} to the main
+ * app over the APP_WORKER service binding — the other half of the two-way
+ * customer sync (see src/worker.js's receiveXeroContactUpdate() for the
+ * "app wins on conflict" policy applied on the receiving end).
+ */
+async function forwardContactUpdate(env, contactId) {
+  if (!env.APP_WORKER || !env.APP_WEBHOOK_FORWARD_TOKEN) return; // Part 4B not finished yet
+  requireEnv(env, ['XERO_CLIENT_ID', 'XERO_CLIENT_SECRET']);
+  const raw = await env.XERO_KV.get(CONNECTION_KEY);
+  if (!raw) return;
+  const conn = JSON.parse(raw);
+
+  let accessToken;
+  try {
+    const refreshed = await refreshAccessToken(env, conn.refreshToken);
+    accessToken = refreshed.access_token;
+    conn.refreshToken = refreshed.refresh_token;
+    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+  } catch (err) {
+    return;
+  }
+
+  const res = await xeroApiFetch(accessToken, conn.tenantId, '/Contacts/' + encodeURIComponent(contactId));
+  const contact = (res.Contacts || [])[0];
+  if (!contact) return;
+
+  const phones = contact.Phones || [];
+  const phoneMatch = phones.find((p) => p.PhoneNumber);
+  const addresses = contact.Addresses || [];
+  const addressMatch = addresses.find((a) => a.AddressLine1);
+
+  await env.APP_WORKER.fetch('https://app-worker.internal/api/internal/xero-contact-update', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + env.APP_WEBHOOK_FORWARD_TOKEN,
+    },
+    body: JSON.stringify({
+      xeroContactId: contact.ContactID,
+      name: contact.Name,
+      email: contact.EmailAddress || '',
+      phone: phoneMatch ? phoneMatch.PhoneNumber : '',
+      address: addressMatch ? addressMatch.AddressLine1 : '',
+      xeroUpdatedAt: contact.UpdatedDateUTC,
+    }),
+  });
 }
 
 async function refreshAccessToken(env, refreshToken) {
