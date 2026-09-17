@@ -131,6 +131,21 @@ export default {
       if (url.pathname === '/task/attach-photo' && request.method === 'GET') {
         return await handleTaskAttachPhoto(url, env);
       }
+      // 2026-09-17, temporary diagnostic (Bug 11 follow-up): after adding
+      // accounting.attachments to SCOPES, the user redeployed and
+      // disconnected/reconnected Xero, but attachments still failed with a
+      // 401 "AuthorizationUnsuccessful" from Xero's own API — meaning the
+      // access token in use still doesn't actually carry that scope,
+      // despite the reconnect. Rather than guessing through another full
+      // invoice+photo test cycle, this route decodes the *current* stored
+      // access token's own `scope` claim (Xero access tokens are JWTs) so
+      // we can see directly, in one request, whether accounting.attachments
+      // actually made it into the granted token this time. Read-only, never
+      // returns the token itself — only its decoded scope list. Safe to
+      // remove once this is resolved.
+      if (url.pathname === '/task/token-scope' && request.method === 'GET') {
+        return await handleTaskTokenScope(url, env);
+      }
       const internalAttachMatch = url.pathname.match(/^\/internal\/invoices\/([^/]+)\/attachments\/([^/]+)$/);
       if (internalAttachMatch && request.method === 'PUT') {
         return await handleInternalAttach(request, env, internalAttachMatch[1], internalAttachMatch[2]);
@@ -256,6 +271,52 @@ async function handleStatus(env) {
   return corsResponse(
     env,
     json({ connected: true, tenantName: conn.tenantName, connectedAt: conn.connectedAt })
+  );
+}
+
+async function handleTaskTokenScope(url, env) {
+  requireEnv(env, ['TASK_TOKEN']);
+  const token = url.searchParams.get('token') || '';
+  if (token !== env.TASK_TOKEN) {
+    return corsResponse(env, json({ ok: false, error: 'unauthorized' }, 401));
+  }
+  requireEnv(env, ['XERO_CLIENT_ID', 'XERO_CLIENT_SECRET']);
+  const raw = await env.XERO_KV.get(CONNECTION_KEY);
+  if (!raw) return corsResponse(env, json({ ok: false, error: 'not_connected' }, 409));
+  const conn = JSON.parse(raw);
+
+  let accessToken;
+  try {
+    const refreshed = await refreshAccessToken(env, conn.refreshToken);
+    accessToken = refreshed.access_token;
+    conn.refreshToken = refreshed.refresh_token;
+    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+  } catch (err) {
+    return corsResponse(env, json({ ok: false, error: 'reauth_required' }, 401));
+  }
+
+  let scope = null;
+  let expiresAt = null;
+  try {
+    const payloadB64 = accessToken.split('.')[1];
+    const normalized = payloadB64.replace(/-/g, '+').replace(/_/g, '/');
+    const decoded = JSON.parse(atob(normalized));
+    scope = decoded.scp || decoded.scope || null; // Xero uses "scp" as an array
+    expiresAt = decoded.exp ? new Date(decoded.exp * 1000).toISOString() : null;
+  } catch (err) {
+    return corsResponse(env, json({ ok: false, error: 'decode_failed', message: String((err && err.message) || err) }, 500));
+  }
+
+  const scopeList = Array.isArray(scope) ? scope : (typeof scope === 'string' ? scope.split(' ') : []);
+  return corsResponse(
+    env,
+    json({
+      ok: true,
+      tenantName: conn.tenantName,
+      hasAttachmentsScope: scopeList.includes('accounting.attachments'),
+      scope: scopeList,
+      accessTokenExpiresAt: expiresAt,
+    })
   );
 }
 
