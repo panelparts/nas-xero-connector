@@ -3,7 +3,7 @@ main = "worker.js"
 compatibility_date = "2024-09-01"
 
 kv_namespaces = [
-  { binding = "XERO_KV", id = "{"tenantId":"fe49ed03-ed40-466b-8f29-256133cdd6e0","tenantName":"Newcastle Automotive Solutions","refreshToken":"mt1VfKulzW_jPbg02HSK4BM3Ny7dWN7WpstA987nVKs","connectedAt":1789712851022}" }
+  { binding = "XERO_KV", id = "7b39de8798254bfba3b592b29e5f56aa" }
 ]
 
 services = [
