@@ -72,7 +72,10 @@
  *   KV secret/vars   XERO_CLIENT_ID, XERO_CLIENT_SECRET, TASK_TOKEN
  *   KV namespace     XERO_KV
  *   optional var     ALLOWED_ORIGIN (defaults to "*")
- *   optional var     DEFAULT_ACCOUNT_CODE (defaults to "200")
+ *   optional var     DEFAULT_ACCOUNT_CODE (defaults to "200") — used both as
+ *        the invoice line items' account code and, as of 2026-09-25, as the
+ *        new SalesDefaultAccountCode stamped on any Xero contact this
+ *        connector creates for the first time (invoice-time or customer-sync)
  *   secret           XERO_WEBHOOK_KEY        (from Xero's Webhooks setup — see Part 4B)
  *   secret           APP_WEBHOOK_FORWARD_TOKEN  (shared with WEBHOOK_FORWARD_TOKEN on the app)
  *   service binding  APP_WORKER  → the newcastle-automotive-solutions Worker
@@ -403,7 +406,14 @@ async function createInvoiceCore(env, payload) {
 
   let contactId;
   try {
-    contactId = await ensureContact(accessToken, conn.tenantId, customerName);
+    // 2026-09-25, at the user's request: when this invoice's customer doesn't
+    // already exist as a Xero contact, ensureContact() is about to create one
+    // from scratch — pass along the same account code the invoice's own line
+    // items use (accountCode, resolved just above) so the new contact isn't
+    // left with no default sales account. Without this, a brand-new contact
+    // created this way has no SalesDefaultAccountCode at all, which is blank
+    // in Xero until someone sets it by hand.
+    contactId = await ensureContact(accessToken, conn.tenantId, customerName, accountCode);
   } catch (err) {
     return { status: 502, body: { ok: false, error: 'contact_failed', message: String(err.message || err) } };
   }
@@ -531,9 +541,17 @@ async function upsertContactCore(env, payload) {
       return { status: 200, body: { ok: true, contactId: c.ContactID, updatedDateUtc: c.UpdatedDateUTC } };
     }
 
+    // 2026-09-25: same reasoning as createInvoiceCore/ensureContact above —
+    // only a brand-new contact gets a default sales account stamped on it
+    // (the update branches above never touch this field), so a customer
+    // synced here for the first time isn't left with a blank default either,
+    // whether or not they ever go through the invoice-time path.
+    const accountCode = payload.accountCode || env.DEFAULT_ACCOUNT_CODE || '200';
     const created = await xeroApiFetch(accessToken, conn.tenantId, '/Contacts', {
       method: 'PUT',
-      body: JSON.stringify({ Contacts: [contactFields] }),
+      body: JSON.stringify({
+        Contacts: [Object.assign({}, contactFields, accountCode ? { SalesDefaultAccountCode: accountCode } : {})],
+      }),
     });
     const c = (created.Contacts || [])[0];
     if (!c) return { status: 502, body: { ok: false, error: 'contact_not_returned' } };
@@ -858,16 +876,25 @@ async function refreshAccessToken(env, refreshToken) {
   return res.json();
 }
 
-async function ensureContact(accessToken, tenantId, name) {
+async function ensureContact(accessToken, tenantId, name, accountCode) {
   const escaped = name.replace(/"/g, '\\"');
   const query = 'Name=="' + escaped + '"';
   const found = await xeroApiFetch(accessToken, tenantId, '/Contacts?where=' + encodeURIComponent(query));
   const existing = (found.Contacts || [])[0];
+  // Only ever set a default on a contact we're creating right now — never
+  // touch an existing contact's default here, in case it was already set
+  // (by hand, or by this same logic on an earlier invoice) to something else.
   if (existing) return existing.ContactID;
 
   const createdRes = await xeroApiFetch(accessToken, tenantId, '/Contacts', {
     method: 'PUT',
-    body: JSON.stringify({ Contacts: [{ Name: name }] }),
+    body: JSON.stringify({
+      Contacts: [
+        accountCode
+          ? { Name: name, SalesDefaultAccountCode: accountCode }
+          : { Name: name },
+      ],
+    }),
   });
   const created = (createdRes.Contacts || [])[0];
   if (!created) throw new Error('contact not returned');
