@@ -44,6 +44,21 @@
  *        Requires `Authorization: Bearer <TASK_TOKEN>` — the other half of
  *        the two-way customer sync, called by the app on every customer
  *        save. See handleUpsertContact()/upsertContactCore() below.
+ *   POST /internal/invoices/{invoiceId}/email
+ *        2026-09-27, at the user's request ("when we push a invoice to xero
+ *        it is adding the invoice to xero but not email the invoice to the
+ *        customer, it needs to approve and email"): calls Xero's own
+ *        POST /Invoices/{InvoiceID}/Email, the same action as clicking
+ *        "Approve & email" in the Xero UI — Xero sends the invoice using its
+ *        own template/branding, from the connected organisation's own email
+ *        address, to the contact's email on file. This is a completely
+ *        separate thing from the app's own "email photos to the customer"
+ *        feature (Resend, see src/worker.js's emailPhotosToCustomer) — that
+ *        one only ever sends the job photos, never the actual Xero invoice.
+ *        Requires `Authorization: Bearer <TASK_TOKEN>`, same as the routes
+ *        above. See handleInternalEmail() below for what it needs from Xero
+ *        to actually succeed (an AUTHORISED invoice, a contact with an email
+ *        address) and the verification gap around its required OAuth scope.
  *   POST /webhook
  *        Xero calls this directly (not the app, not a scheduled task) the
  *        moment an invoice OR a contact changes on the Xero side — including
@@ -152,6 +167,10 @@ export default {
       const internalAttachMatch = url.pathname.match(/^\/internal\/invoices\/([^/]+)\/attachments\/([^/]+)$/);
       if (internalAttachMatch && request.method === 'PUT') {
         return await handleInternalAttach(request, env, internalAttachMatch[1], internalAttachMatch[2]);
+      }
+      const internalEmailMatch = url.pathname.match(/^\/internal\/invoices\/([^/]+)\/email$/);
+      if (internalEmailMatch && request.method === 'POST') {
+        return await handleInternalEmail(request, env, internalEmailMatch[1]);
       }
       if (url.pathname === '/webhook' && request.method === 'POST') {
         return await handleWebhook(request, env);
@@ -714,6 +733,103 @@ async function handleInternalAttach(request, env, invoiceId, filename) {
   const attachData = await attachRes.json().catch(() => null);
   const created = attachData && attachData.Attachments && attachData.Attachments[0];
   return corsResponse(env, json({ ok: true, attachmentId: created ? created.AttachmentID : null, filename: filename }));
+}
+
+/**
+ * 2026-09-27, at the user's request ("when we push a invoice to xero it is
+ * adding the invoice to xero but not email the invoice to the customer, it
+ * needs to approve and email"): calls Xero's own
+ * POST /Invoices/{InvoiceID}/Email — the exact API action behind the
+ * "Approve & email" button in the Xero UI. Xero generates and sends the
+ * invoice itself (its own template, from the organisation's own email
+ * address) to the contact's email on file; this Worker has no visibility
+ * into or control over that email's actual content or delivery.
+ *
+ * Two real preconditions, both worth surfacing clearly rather than a bare
+ * failure, since this is easy to hit in normal use:
+ *   - The invoice must actually be AUTHORISED in Xero already — Xero won't
+ *     email a Draft (same reason the Xero UI only offers "Approve & email"
+ *     before approval, and plain "Email" after — there's no "email a draft"
+ *     path at all). The caller (sendInvoiceToXero() in the app's src/worker.js)
+ *     already knows the real created.Status from createInvoiceCore()'s
+ *     response (see the 2026-09-27 "still going as drafts" fix), so it skips
+ *     calling this route at all when that isn't AUTHORISED, rather than
+ *     relying on this endpoint to reject it.
+ *   - The Xero contact needs an email address on file. A brand-new contact
+ *     created by ensureContact()/upsertContactCore() only gets an email if
+ *     the app's own customer record had one — Xero will reject the send
+ *     otherwise. Reported back as a plain error rather than silently no-op'd,
+ *     so the frontend can tell the user to add the customer's email and
+ *     resend rather than assuming it went out.
+ *
+ * Honest verification gap, same standard as every other Xero-adjacent
+ * feature in this project: this endpoint (via Xero's generated Node SDK
+ * docs, since developer.xero.com's own reference pages are JS-rendered and
+ * unreadable from this sandbox — same limitation hit before) is documented
+ * as requiring the `accounting.transactions` scope, but this connector's
+ * SCOPES only lists `accounting.invoices` (not `accounting.transactions`) —
+ * and invoice creation itself has been working live for weeks under that
+ * scope, which strongly suggests Xero's current granular-scopes system
+ * already treats `accounting.invoices` as covering this too (their overlap
+ * isn't independently documented anywhere this session could actually read).
+ * If the very first real send comes back here as `insufficient_scope` (a 403
+ * from Xero), the fix is adding `accounting.transactions` to SCOPES below and
+ * doing one disconnect/reconnect — exactly the same pattern as the
+ * accounting.attachments scope gap (see Bug 11 above).
+ */
+async function handleInternalEmail(request, env, invoiceId) {
+  requireEnv(env, ['TASK_TOKEN']);
+  const auth = request.headers.get('Authorization') || '';
+  const token = auth.replace(/^Bearer\s+/i, '');
+  if (token !== env.TASK_TOKEN) {
+    return corsResponse(env, json({ ok: false, error: 'unauthorized' }, 401));
+  }
+
+  requireEnv(env, ['XERO_CLIENT_ID', 'XERO_CLIENT_SECRET']);
+  const raw = await env.XERO_KV.get(CONNECTION_KEY);
+  if (!raw) return corsResponse(env, json({ ok: false, error: 'not_connected' }, 409));
+  const conn = JSON.parse(raw);
+
+  let accessToken;
+  try {
+    const refreshed = await refreshAccessToken(env, conn.refreshToken);
+    accessToken = refreshed.access_token;
+    conn.refreshToken = refreshed.refresh_token;
+    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+  } catch (err) {
+    return corsResponse(env, json({ ok: false, error: 'reauth_required' }, 401));
+  }
+
+  let emailRes;
+  try {
+    // Xero's own docs/SDKs call this a "requestEmpty" body — a plain {} is
+    // the whole request; there's nothing else to configure on this call.
+    emailRes = await fetch(XERO_API_BASE + '/Invoices/' + encodeURIComponent(invoiceId) + '/Email', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + accessToken,
+        'Xero-tenant-id': conn.tenantId,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: '{}',
+    });
+  } catch (err) {
+    return corsResponse(env, json({ ok: false, error: 'email_failed', message: String((err && err.message) || err) }, 502));
+  }
+  if (!emailRes.ok) {
+    // Xero returns 403 for a missing/insufficient scope, and 400 for things
+    // like "no contact email address" or "invoice not authorised" — surfaced
+    // verbatim (truncated) rather than guessed at, since both are real,
+    // actionable outcomes the frontend should be able to tell apart.
+    const text = await emailRes.text().catch(() => '');
+    const errCode = emailRes.status === 403 ? 'insufficient_scope' : 'email_rejected';
+    return corsResponse(env, json({ ok: false, error: errCode, status: emailRes.status, message: text.slice(0, 300) }, 502));
+  }
+  // A successful call here is Xero's own confirmation that it queued the
+  // send — it returns 200 with an empty Invoices array in practice, never a
+  // meaningful body, so this deliberately doesn't try to parse or return one.
+  return corsResponse(env, json({ ok: true }));
 }
 
 /* ------------------------------- webhook --------------------------------- */
