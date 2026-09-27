@@ -450,6 +450,21 @@ async function createInvoiceCore(env, payload) {
     return { status: 502, body: { ok: false, error: 'invoice_not_returned' } };
   }
 
+  // 2026-09-27, at the user's request ("invoices sent to Xero are still
+  // going as drafts" — after the 2026-09-25 fix that sends Status:
+  // 'AUTHORISED' whenever authorise:true is passed, which it always is now):
+  // the code has always asked Xero for AUTHORISED, but never actually
+  // checked what Xero did with that request. Xero is known to silently
+  // create an invoice as DRAFT anyway — while still returning 200 OK, no
+  // error — when it can't be approved as sent (a common real-world cause:
+  // an AccountCode that doesn't exist/isn't enabled for revenue in this
+  // org's Chart of Accounts, an invalid TaxType/AccountCode combination, or
+  // a Contact missing a required field) — Xero reports why via
+  // ValidationErrors/Warnings on the created invoice object rather than
+  // failing the request outright. Surfacing `created.Status` (what Xero
+  // actually did) and any errors/warnings here, rather than trusting the
+  // request we sent, so the real cause can be read directly off a live
+  // response instead of guessed at again.
   return {
     status: 200,
     body: {
@@ -457,6 +472,11 @@ async function createInvoiceCore(env, payload) {
       invoiceId: created.InvoiceID,
       invoiceNumber: created.InvoiceNumber,
       invoiceUrl: 'https://go.xero.com/AccountsReceivable/View.aspx?InvoiceID=' + created.InvoiceID,
+      xeroStatus: created.Status,
+      requestedAuthorise: !!payload.authorise,
+      hasErrors: !!created.HasErrors,
+      validationErrors: created.ValidationErrors || null,
+      warnings: created.Warnings || null,
     },
   };
 }
