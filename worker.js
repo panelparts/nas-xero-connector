@@ -443,7 +443,21 @@ async function createInvoiceCore(env, payload) {
     Date: invoiceDate,
     DueDate: dueDate,
     Reference: payload.reference || '',
-    LineAmountType: 'Exclusive',
+    // 2026-09-29, at the user's request ("All prices on products and
+    // services are gst inclusive please change this", then extended to the
+    // labour rate too): every UnitAmount below is now the app's own final,
+    // GST-inclusive charge for that line (see gstBreakdown() in
+    // public/index.html) — the app itself no longer adds 10% on top before
+    // sending. This USED to be 'Exclusive' (Xero adding its own 10% GST on
+    // top of each UnitAmount, matching the app's old ex-GST catalog prices).
+    // Left as 'Exclusive' now, Xero would add a SECOND 10% on top of an
+    // already-inclusive price — e.g. a $485 service would show as $533.50 in
+    // Xero. 'Inclusive' tells Xero the UnitAmount already has GST baked in:
+    // it backs the GST component out for its own BAS reporting (still using
+    // each line's TaxType below) instead of adding more, so the invoice
+    // total in Xero ends up exactly equal to the sum of these UnitAmounts —
+    // matching what the app itself shows and charges.
+    LineAmountType: 'Inclusive',
     Status: payload.authorise ? 'AUTHORISED' : 'DRAFT',
     LineItems: lineItems.map((li) => ({
       Description: String(li.description || 'Item').slice(0, 4000),
