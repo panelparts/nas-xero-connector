@@ -309,10 +309,9 @@ async function handleTaskTokenScope(url, env) {
 
   let accessToken;
   try {
-    const refreshed = await refreshAccessToken(env, conn.refreshToken);
-    accessToken = refreshed.access_token;
-    conn.refreshToken = refreshed.refresh_token;
-    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+    const tok = await getFreshAccessToken(env, conn);
+    accessToken = tok.accessToken;
+    if (tok.changed) await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
   } catch (err) {
     return corsResponse(env, json({ ok: false, error: 'reauth_required' }, 401));
   }
@@ -413,12 +412,9 @@ async function createInvoiceCore(env, payload) {
 
   let accessToken;
   try {
-    const refreshed = await refreshAccessToken(env, conn.refreshToken);
-    accessToken = refreshed.access_token;
-    // Xero rotates refresh tokens on every use — persist the new one or the
-    // next call will fail.
-    conn.refreshToken = refreshed.refresh_token;
-    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+    const tok = await getFreshAccessToken(env, conn);
+    accessToken = tok.accessToken;
+    if (tok.changed) await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
   } catch (err) {
     return { status: 401, body: { ok: false, error: 'reauth_required' } };
   }
@@ -547,10 +543,9 @@ async function upsertContactCore(env, payload) {
 
   let accessToken;
   try {
-    const refreshed = await refreshAccessToken(env, conn.refreshToken);
-    accessToken = refreshed.access_token;
-    conn.refreshToken = refreshed.refresh_token;
-    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+    const tok = await getFreshAccessToken(env, conn);
+    accessToken = tok.accessToken;
+    if (tok.changed) await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
   } catch (err) {
     return { status: 401, body: { ok: false, error: 'reauth_required' } };
   }
@@ -642,10 +637,9 @@ async function handleTaskAttachPhoto(url, env) {
 
   let accessToken;
   try {
-    const refreshed = await refreshAccessToken(env, conn.refreshToken);
-    accessToken = refreshed.access_token;
-    conn.refreshToken = refreshed.refresh_token;
-    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+    const tok = await getFreshAccessToken(env, conn);
+    accessToken = tok.accessToken;
+    if (tok.changed) await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
   } catch (err) {
     return corsResponse(env, json({ ok: false, error: 'reauth_required' }, 401));
   }
@@ -714,10 +708,9 @@ async function handleInternalAttach(request, env, invoiceId, filename) {
 
   let accessToken;
   try {
-    const refreshed = await refreshAccessToken(env, conn.refreshToken);
-    accessToken = refreshed.access_token;
-    conn.refreshToken = refreshed.refresh_token;
-    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+    const tok = await getFreshAccessToken(env, conn);
+    accessToken = tok.accessToken;
+    if (tok.changed) await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
   } catch (err) {
     return corsResponse(env, json({ ok: false, error: 'reauth_required' }, 401));
   }
@@ -806,10 +799,9 @@ async function handleInternalEmail(request, env, invoiceId) {
 
   let accessToken;
   try {
-    const refreshed = await refreshAccessToken(env, conn.refreshToken);
-    accessToken = refreshed.access_token;
-    conn.refreshToken = refreshed.refresh_token;
-    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+    const tok = await getFreshAccessToken(env, conn);
+    accessToken = tok.accessToken;
+    if (tok.changed) await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
   } catch (err) {
     return corsResponse(env, json({ ok: false, error: 'reauth_required' }, 401));
   }
@@ -935,10 +927,9 @@ async function forwardInvoiceStatus(env, invoiceId) {
 
   let accessToken;
   try {
-    const refreshed = await refreshAccessToken(env, conn.refreshToken);
-    accessToken = refreshed.access_token;
-    conn.refreshToken = refreshed.refresh_token;
-    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+    const tok = await getFreshAccessToken(env, conn);
+    accessToken = tok.accessToken;
+    if (tok.changed) await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
   } catch (err) {
     return; // can't refresh right now — a later webhook or a manual check will catch up
   }
@@ -978,10 +969,9 @@ async function forwardContactUpdate(env, contactId) {
 
   let accessToken;
   try {
-    const refreshed = await refreshAccessToken(env, conn.refreshToken);
-    accessToken = refreshed.access_token;
-    conn.refreshToken = refreshed.refresh_token;
-    await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
+    const tok = await getFreshAccessToken(env, conn);
+    accessToken = tok.accessToken;
+    if (tok.changed) await env.XERO_KV.put(CONNECTION_KEY, JSON.stringify(conn));
   } catch (err) {
     return;
   }
@@ -1024,6 +1014,50 @@ async function refreshAccessToken(env, refreshToken) {
   });
   if (!res.ok) throw new Error('refresh failed: ' + res.status);
   return res.json();
+}
+
+/**
+ * 2026-10-01, in response to Cloudflare's "KV operations are nearing the
+ * daily cap" warning email: every Xero-touching route below used to call
+ * refreshAccessToken() UNCONDITIONALLY on every single request — a real
+ * network round trip to Xero's /token endpoint, followed by an
+ * env.XERO_KV.put() to persist the rotated refresh token, every time, even
+ * though a Xero access token is actually valid for 30 minutes
+ * (expires_in, normally 1800s). Workers KV's free tier allows far fewer
+ * writes per day (1,000) than reads (100,000) — and an invoice with several
+ * photos attached calls handleInternalAttach() once PER PHOTO, each one its
+ * own unconditional refresh+write, so a single invoice with, say, 8 photos
+ * was burning 9 KV writes by itself (1 for creating the invoice, 8 for the
+ * attachments) before this fix, on top of every invoice send, every
+ * customer sync push, and every webhook-driven status/contact pull. That's
+ * the write volume the cap-warning was almost certainly measuring — not
+ * anything actually wrong with the app, just an easy-to-miss inefficiency
+ * in how often this connector was rotating a token it didn't need to.
+ *
+ * Fixed by caching the access token (and its expiry) directly on the same
+ * stored connection object in KV: a call now only hits Xero's /token
+ * endpoint — and only writes back to KV — when there's no cached token yet,
+ * or the cached one is within 60 seconds of expiring. Everything else about
+ * the flow (refresh-token rotation, what gets stored, how a refresh failure
+ * is surfaced) is unchanged; call sites below just swap their inline
+ * refresh+write block for one call to this, then skip the KV.put entirely
+ * when the cache was still good (conn is mutated in place either way, so a
+ * call site that already does `const conn = JSON.parse(raw)` beforehand
+ * sees the refreshed fields with no other change needed).
+ *
+ * Returns { accessToken, changed } — `changed` tells the caller whether
+ * `conn` actually needs persisting to KV this time.
+ */
+async function getFreshAccessToken(env, conn) {
+  const now = Date.now();
+  if (conn.accessToken && conn.accessTokenExpiresAt && conn.accessTokenExpiresAt - now > 60000) {
+    return { accessToken: conn.accessToken, changed: false };
+  }
+  const refreshed = await refreshAccessToken(env, conn.refreshToken);
+  conn.accessToken = refreshed.access_token;
+  conn.refreshToken = refreshed.refresh_token;
+  conn.accessTokenExpiresAt = now + (Number(refreshed.expires_in || 1800) * 1000);
+  return { accessToken: conn.accessToken, changed: true };
 }
 
 async function ensureContact(accessToken, tenantId, name, accountCode) {
