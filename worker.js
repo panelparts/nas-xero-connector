@@ -173,7 +173,7 @@ export default {
         return await handleInternalEmail(request, env, internalEmailMatch[1]);
       }
       if (url.pathname === '/webhook' && request.method === 'POST') {
-        return await handleWebhook(request, env);
+        return await handleWebhook(request, env, ctx);
       }
       return corsResponse(env, json({ error: 'not_found' }, 404));
     } catch (err) {
@@ -849,7 +849,7 @@ async function handleInternalEmail(request, env, invoiceId) {
    responses, so a problem with one invoice should never take down delivery
    for every other one. */
 
-async function handleWebhook(request, env) {
+async function handleWebhook(request, env, ctx) {
   if (!env.XERO_WEBHOOK_KEY) {
     // Not set up yet (Part 4B not done) — nothing we can safely verify, so
     // there's nothing safe to do with this call.
@@ -882,21 +882,49 @@ async function handleWebhook(request, env) {
     new Set(events.filter((e) => e && e.eventCategory === 'CONTACT' && e.resourceId).map((e) => e.resourceId))
   );
 
-  for (const invoiceId of invoiceIds) {
-    try {
-      await forwardInvoiceStatus(env, invoiceId);
-    } catch (err) {
-      // Best-effort, per invoice — see the note above on why this never
-      // turns into a non-200 response for the whole webhook call.
-    }
-  }
-  for (const contactId of contactIds) {
-    try {
-      await forwardContactUpdate(env, contactId);
-    } catch (err) {
-      // Best-effort, per contact — same reasoning as above.
-    }
-  }
+  // 2026-10-03, after Xero auto-disabled this webhook subscription
+  // ("Webhook disabled after failed request" — failing from the very first
+  // delivery in a run, for a full 24 hours straight, before being
+  // disabled): the signature is verified and the payload is already fully
+  // parsed above, so from here there is nothing left that could reject this
+  // call — everything below is best-effort, per-resource processing that
+  // was previously done BEFORE responding to Xero. Xero expects a response
+  // within 5 seconds; each invoice/contact forwarded here does a token
+  // refresh-or-cache check, a real Xero API lookup, and a service-binding
+  // call to the main app — three round trips — and a single webhook
+  // delivery can bundle several events into one call. Doing all of that
+  // sequentially, before ever sending a response, risked tipping over that
+  // 5-second budget on any delivery with more than a couple of events,
+  // which Xero also counts as a failed delivery, same as an outright error.
+  // The most likely cause of THIS particular incident is actually something
+  // else (see the message that shipped alongside this fix — almost
+  // certainly XERO_WEBHOOK_KEY being out of sync with Xero's current
+  // signing key, which would reject every delivery at the signature check
+  // above, not get this far at all) — but responding fast and doing the
+  // real work in the background via ctx.waitUntil() is a correctness fix
+  // regardless of what actually caused this specific disablement, and
+  // removes a real way this could recur later even once today's actual
+  // cause is fixed.
+  ctx.waitUntil(
+    (async () => {
+      for (const invoiceId of invoiceIds) {
+        try {
+          await forwardInvoiceStatus(env, invoiceId);
+        } catch (err) {
+          // Best-effort, per invoice — a problem with one invoice should
+          // never take down delivery for every other one, and by this point
+          // Xero has already been told this request succeeded.
+        }
+      }
+      for (const contactId of contactIds) {
+        try {
+          await forwardContactUpdate(env, contactId);
+        } catch (err) {
+          // Best-effort, per contact — same reasoning as above.
+        }
+      }
+    })()
+  );
 
   return new Response('', { status: 200 });
 }
