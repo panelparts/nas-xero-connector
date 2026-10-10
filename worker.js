@@ -453,7 +453,7 @@ async function createInvoiceCore(env, payload) {
     // each line's TaxType below) instead of adding more, so the invoice
     // total in Xero ends up exactly equal to the sum of these UnitAmounts —
     // matching what the app itself shows and charges.
-    LineAmountType: 'Inclusive',
+    LineAmountTypes: 'Inclusive',
     Status: payload.authorise ? 'AUTHORISED' : 'DRAFT',
     LineItems: lineItems.map((li) => ({
       Description: String(li.description || 'Item').slice(0, 4000),
@@ -502,6 +502,9 @@ async function createInvoiceCore(env, payload) {
       invoiceNumber: created.InvoiceNumber,
       invoiceUrl: 'https://go.xero.com/AccountsReceivable/View.aspx?InvoiceID=' + created.InvoiceID,
       xeroStatus: created.Status,
+      xeroTotal: created.Total,
+      xeroSubTotal: created.SubTotal,
+      xeroLineAmountTypes: created.LineAmountTypes,
       requestedAuthorise: !!payload.authorise,
       hasErrors: !!created.HasErrors,
       validationErrors: created.ValidationErrors || null,
