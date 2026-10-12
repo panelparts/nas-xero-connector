@@ -395,6 +395,19 @@ async function handleTaskCreateInvoice(url, env) {
   return corsResponse(env, json(result.body, result.status));
 }
 
+const DUE_DAYS_AFTER_MONTH_END = 31;
+function dueDateAfterMonthEnd(iso, n) {
+  const y = Number(iso.slice(0, 4)), m = Number(iso.slice(5, 7));
+  const d = new Date(Date.UTC(y, m, 0)); // day 0 of next month = last day of this month
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function addDaysISO(iso, n) {
+  const d = new Date(iso + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
 async function createInvoiceCore(env, payload) {
   requireEnv(env, ['XERO_CLIENT_ID', 'XERO_CLIENT_SECRET']);
   const raw = await env.XERO_KV.get(CONNECTION_KEY);
@@ -407,8 +420,16 @@ async function createInvoiceCore(env, payload) {
     return { status: 400, body: { ok: false, error: 'no_line_items' } };
   }
   const accountCode = payload.accountCode || env.DEFAULT_ACCOUNT_CODE || '200';
-  const invoiceDate = payload.date || new Date().toISOString().slice(0, 10);
-  const dueDate = payload.dueDate || invoiceDate;
+  // 2026-10-12, at the user's request (the app never sent a due date and this
+  // used to fall back to the invoice date itself, so Xero showed every invoice
+  // as due at once). Payment terms are now "31 days after the end of the
+  // invoice month" (e.g. invoice dated 12 Oct -> end of Oct 31 Oct + 31 days
+  // = 1 Dec). Change DUE_DAYS_AFTER_MONTH_END to adjust. "Today" is taken in
+  // Sydney time (the UTC date is yesterday for the first ~10 hours of every
+  // local day).
+  const sydneyToday = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' });
+  const invoiceDate = payload.date || sydneyToday;
+  const dueDate = payload.dueDate || dueDateAfterMonthEnd(invoiceDate, DUE_DAYS_AFTER_MONTH_END);
 
   let accessToken;
   try {
